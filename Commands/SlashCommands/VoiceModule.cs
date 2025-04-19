@@ -8,18 +8,27 @@ using NetCord;
 using NetCord.Gateway;
 using System.Diagnostics;
 using NetCord.Rest;
+using TranscriberBot.Data.Models;
+using TranscriberBot.Data.Handler;
 
 namespace TranscriberBot.Commands.SlashCommands
 {
     [SlashCommand("voice", "Voice session commands")]
     public class VoiceModule : ApplicationCommandModule<ApplicationCommandContext>
     {
-
         private static readonly ConcurrentDictionary<ulong, VoiceSession> _voiceSessions = new();
+        private const string voiceModuleConfigPath = "voicemodule.json";
         private const int MaxConcurrentTranscriptions = 5;
         private const int MaxConcurrentTts = 10;
         private static readonly TimeSpan SilenceThreshold = TimeSpan.FromMilliseconds(500);
         private static readonly HttpClient _http = new();
+
+
+
+        private static void SaveIgnoreConfig()
+        {
+            JsonHandler.SaveJson(voiceModuleConfigPath, Bot.voiceModuleConfig);
+        }
 
         [SubSlashCommand("join", "Join your current voice channel.")]
         public async Task JoinAsync()
@@ -43,7 +52,7 @@ namespace TranscriberBot.Commands.SlashCommands
                 new() { RedirectInputStreams = true }
             );
             await voiceClient.StartAsync();
-            var session = new VoiceSession(voiceClient, guild, (TextChannel)Context.Channel);
+            var session = new VoiceSession(voiceClient, guild, (TextChannel)Context.Channel, Bot.voiceModuleConfig);
             _voiceSessions[guild.Id] = session;
         }
 
@@ -126,6 +135,60 @@ namespace TranscriberBot.Commands.SlashCommands
             await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Transcription disabled."));
         }
 
+        [SubSlashCommand("tts_ignore", "Ignore yourself from TTS.")]
+        public async Task TtsIgnoreAsync()
+        {
+            var userId = Context.User.Id;
+            if (Bot.voiceModuleConfig.TtsIgnore.Contains(userId))
+            {
+                await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You are already ignored for TTS."));
+                return;
+            }
+            Bot.voiceModuleConfig.TtsIgnore.Add(userId);
+            SaveIgnoreConfig();
+            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You will now be ignored for TTS."));
+        }
+
+        [SubSlashCommand("tts_unignore", "Stop ignoring yourself from TTS.")]
+        public async Task TtsUnignoreAsync()
+        {
+            var userId = Context.User.Id;
+            if (!Bot.voiceModuleConfig.TtsIgnore.Remove(userId))
+            {
+                await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You were not ignored for TTS."));
+                return;
+            }
+            SaveIgnoreConfig();
+            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You will now be processed for TTS."));
+        }
+
+        [SubSlashCommand("transcriber_ignore", "Ignore yourself from transcription.")]
+        public async Task TranscriberIgnoreAsync()
+        {
+            var userId = Context.User.Id;
+            if (Bot.voiceModuleConfig.TranscriberIgnore.Contains(userId))
+            {
+                await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You are already ignored for transcription."));
+                return;
+            }
+            Bot.voiceModuleConfig.TranscriberIgnore.Add(userId);
+            SaveIgnoreConfig();
+            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You will now be ignored for transcription."));
+        }
+
+        [SubSlashCommand("transcriber_unignore", "Stop ignoring yourself from transcription.")]
+        public async Task TranscriberUnignoreAsync()
+        {
+            var userId = Context.User.Id;
+            if (!Bot.voiceModuleConfig.TranscriberIgnore.Remove(userId))
+            {
+                await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You were not ignored for transcription."));
+                return;
+            }
+            SaveIgnoreConfig();
+            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You will now be processed for transcription."));
+        }
+
         private class VoiceSession : IDisposable
         {
             public VoiceClient VoiceClient { get; }
@@ -141,12 +204,14 @@ namespace TranscriberBot.Commands.SlashCommands
             private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _silenceCts = new();
             public OpusDecoder? _decoder;
             public WaveFormat? _waveFormat;
+            private readonly VoiceModuleConfig _moduleConfig;
 
-            public VoiceSession(VoiceClient voiceClient, Guild guild, TextChannel channel)
+            public VoiceSession(VoiceClient voiceClient, Guild guild, TextChannel channel, VoiceModuleConfig ignoreConfig)
             {
                 VoiceClient = voiceClient;
                 Guild = guild;
                 TextChannel = channel;
+                _moduleConfig = ignoreConfig;
             }
 
             public void EnableTts(GatewayClient client, TextChannel channel)
@@ -155,7 +220,7 @@ namespace TranscriberBot.Commands.SlashCommands
                 TtsEnabled = true;
                 _ttsHandler = async msg =>
                 {
-                    if (msg.Author.IsBot || msg.Channel.Id != channel.Id) return;
+                    if (msg.Author.IsBot || msg.Channel.Id != channel.Id || _moduleConfig.TtsIgnore.Contains(msg.Author.Id)) return;
                     await _ttsSem.WaitAsync();
                     try
                     {
@@ -186,6 +251,8 @@ namespace TranscriberBot.Commands.SlashCommands
                 _transcriptionHandler = args =>
                 {
                     var uid = args.UserId;
+                    if (_moduleConfig.TranscriberIgnore.Contains(uid))
+                        return ValueTask.CompletedTask;
                     var buffer = GetBuffer(uid);
                     var pcm = new byte[Opus.SamplesPerChannel * _waveFormat.Channels * sizeof(short)];
                     _decoder.Decode(args.Frame.Span, pcm);
@@ -270,7 +337,7 @@ namespace TranscriberBot.Commands.SlashCommands
                 var file = Path.Combine(Path.GetTempPath(), $"transcript_{userId}_{Guid.NewGuid()}.wav");
                 using (var writer = new WaveFileWriter(file, session._waveFormat))
                     writer.Write(ms.ToArray(), 0, (int)ms.Length);
-                var client = new AssemblyAIClient(Bot.configFile?.AssemblyAIToken ?? "no api key");
+                var client = new AssemblyAIClient(Bot.botConfig?.AssemblyAIToken ?? "no api key");
                 var transcript = await client.Transcripts.TranscribeAsync(
                     new FileInfo(file),
                     new TranscriptOptionalParams { SpeakerLabels = false }
@@ -294,7 +361,6 @@ namespace TranscriberBot.Commands.SlashCommands
         }
     }
 }
-
 
 
 //[SlashCommand("speechtranscript", "Live voice transcription using local SpeechRecognitionEngine")]

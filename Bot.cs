@@ -19,16 +19,17 @@ namespace TranscriberBot
 {
     public static class Bot
     {
-        public static Config? configFile { get; private set; }
-        
-        public static async Task InitializeAsync(Config config)
+        public static Config? botConfig { get; private set; }
+        public static VoiceModuleConfig? voiceModuleConfig { get; private set; }
+        public static async Task InitializeAsync(Config config, VoiceModuleConfig voiceConfig)
         {
-            configFile = config;
+            botConfig = config;
+            voiceModuleConfig = voiceConfig;
             GatewayClientConfiguration gatewayClientConfig = new GatewayClientConfiguration()
                 {
                 Intents = default
             };
-            GatewayClient client = new(new BotToken(configFile.BotToken), gatewayClientConfig);
+            GatewayClient client = new(new BotToken(botConfig.BotToken), gatewayClientConfig);
 
             ApplicationCommandService<ApplicationCommandContext> applicationCommandService = new();
             applicationCommandService.AddModules(typeof(Program).Assembly);
