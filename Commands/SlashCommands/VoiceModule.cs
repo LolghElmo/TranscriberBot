@@ -1,11 +1,5 @@
-﻿using System;
-using System.IO;
-using System.Net.Http;
-using System.Collections.Concurrent;
-using System.Threading;
-using System.Threading.Tasks;
+﻿using System.Collections.Concurrent;
 using NAudio.Wave;
-using NAudio.Wave.SampleProviders;
 using AssemblyAI;
 using AssemblyAI.Transcripts;
 using NetCord.Gateway.Voice;
@@ -288,9 +282,11 @@ namespace TranscriberBot.Commands.SlashCommands
                     new TranscriptOptionalParams { SpeakerLabels = false }
                 );
                 transcript.EnsureStatusCompleted();
-                var text = string.IsNullOrWhiteSpace(transcript.Text) ? "(no speech detected)" : transcript.Text;
-                var user = await guild.GetUserAsync(userId);
-                await session.TextChannel.SendMessageAsync($"**{user.Username}:** {text}");
+                if (!string.IsNullOrWhiteSpace(transcript.Text))
+                {
+                    var user = await guild.GetUserAsync(userId);
+                    await session.TextChannel.SendMessageAsync($"**{user.Username}:** {transcript.Text}");
+                }
                 File.Delete(file);
             }
             catch (Exception ex)
