@@ -1,7 +1,9 @@
-﻿internal class Program
+﻿using TranscriberBot;
+
+public class Program
 {
-    private static void Main(string[] args)
+    private static async Task Main(string[] args)
     {
-        Console.WriteLine("Hello, World!");
+        await Bot.InitializeAsync();
     }
 }
