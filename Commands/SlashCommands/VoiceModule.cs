@@ -15,18 +15,12 @@ namespace TranscriberBot.Commands.SlashCommands
     public class VoiceModule : ApplicationCommandModule<ApplicationCommandContext>
     {
 
-        private static string _assemblyAIToken;
         private static readonly ConcurrentDictionary<ulong, VoiceSession> _voiceSessions = new();
         private const int MaxConcurrentTranscriptions = 5;
         private const int MaxConcurrentTts = 10;
         private static readonly TimeSpan SilenceThreshold = TimeSpan.FromMilliseconds(500);
         private static readonly HttpClient _http = new();
 
-
-        public VoiceModule()
-        {
-            _assemblyAIToken = Bot.configFile.BotToken;
-        }
         [SubSlashCommand("join", "Join your current voice channel.")]
         public async Task JoinAsync()
         {
@@ -276,7 +270,7 @@ namespace TranscriberBot.Commands.SlashCommands
                 var file = Path.Combine(Path.GetTempPath(), $"transcript_{userId}_{Guid.NewGuid()}.wav");
                 using (var writer = new WaveFileWriter(file, session._waveFormat))
                     writer.Write(ms.ToArray(), 0, (int)ms.Length);
-                var client = new AssemblyAIClient(_assemblyAIToken);
+                var client = new AssemblyAIClient(Bot.configFile?.AssemblyAIToken ?? "no api key");
                 var transcript = await client.Transcripts.TranscribeAsync(
                     new FileInfo(file),
                     new TranscriptOptionalParams { SpeakerLabels = false }
