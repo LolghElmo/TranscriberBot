@@ -21,15 +21,14 @@ namespace TranscriberBot
     {
         public static Config? configFile { get; private set; }
         
-        public static async Task InitializeAsync()
+        public static async Task InitializeAsync(Config config)
         {
-
-            configFile = JsonHandler.LoadJson<Config>(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json"));
-            GatewayClientConfiguration config = new GatewayClientConfiguration()
+            configFile = config;
+            GatewayClientConfiguration gatewayClientConfig = new GatewayClientConfiguration()
                 {
                 Intents = default
             };
-            GatewayClient client = new(new BotToken(configFile.BotToken), config);
+            GatewayClient client = new(new BotToken(configFile.BotToken), gatewayClientConfig);
 
             ApplicationCommandService<ApplicationCommandContext> applicationCommandService = new();
             applicationCommandService.AddModules(typeof(Program).Assembly);
