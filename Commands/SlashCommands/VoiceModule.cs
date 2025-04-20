@@ -10,6 +10,7 @@ using System.Diagnostics;
 using NetCord.Rest;
 using TranscriberBot.Data.Models;
 using TranscriberBot.Data.Handler;
+using System.Threading.Channels;
 
 namespace TranscriberBot.Commands.SlashCommands
 {
@@ -29,6 +30,7 @@ namespace TranscriberBot.Commands.SlashCommands
         {
             JsonHandler.SaveJson(voiceModuleConfigPath, Bot.voiceModuleConfig);
         }
+
 
         [SubSlashCommand("join", "Join your current voice channel.")]
         public async Task JoinAsync()
@@ -66,12 +68,13 @@ namespace TranscriberBot.Commands.SlashCommands
                 return;
             }
             session.DisableTranscription();
-            session.DisableTts(Context.Client);
+            await session.DisableTtsAsync(Context.Client);
             await session.VoiceClient.CloseAsync();
             await Context.Client.UpdateVoiceStateAsync(new VoiceStateProperties(guildId, null));
             session.Dispose();
             await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Left the voice channel and disabled all features."));
         }
+
 
         [SubSlashCommand("enable_tts", "Enable TTS in the current session.")]
         public async Task EnableTtsAsync()
@@ -87,9 +90,11 @@ namespace TranscriberBot.Commands.SlashCommands
                 await Context.Interaction.SendResponseAsync(InteractionCallback.Message("TTS is already enabled."));
                 return;
             }
-            session.EnableTts(Context.Client, (TextChannel)Context.Channel);
+            await session.EnableTtsAsync(Context.Client, (TextChannel)Context.Channel);
             await Context.Interaction.SendResponseAsync(InteractionCallback.Message("TTS enabled."));
         }
+
+
 
         [SubSlashCommand("disable_tts", "Disable TTS in the current session.")]
         public async Task DisableTtsAsync()
@@ -100,7 +105,7 @@ namespace TranscriberBot.Commands.SlashCommands
                 await Context.Interaction.SendResponseAsync(InteractionCallback.Message("TTS is not enabled."));
                 return;
             }
-            session.DisableTts(Context.Client);
+            await session.DisableTtsAsync(Context.Client);
             await Context.Interaction.SendResponseAsync(InteractionCallback.Message("TTS disabled."));
         }
 
@@ -198,14 +203,15 @@ namespace TranscriberBot.Commands.SlashCommands
             public bool TranscriptionEnabled { get; private set; }
             private Func<Message, ValueTask>? _ttsHandler;
             private Func<VoiceReceiveEventArgs, ValueTask>? _transcriptionHandler;
-            public readonly SemaphoreSlim _ttsSem = new(MaxConcurrentTts);
-            public readonly SemaphoreSlim _transcriptionSem = new(MaxConcurrentTranscriptions);
+            private readonly SemaphoreSlim _ttsSem = new(MaxConcurrentTts);
+            internal readonly SemaphoreSlim _transcriptionSem = new(MaxConcurrentTranscriptions);
             private readonly ConcurrentDictionary<ulong, MemoryStream> _buffers = new();
             private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _silenceCts = new();
-            public OpusDecoder? _decoder;
-            public WaveFormat? _waveFormat;
+            private OpusDecoder? _decoder;
+            internal WaveFormat? _waveFormat;
             private readonly VoiceModuleConfig _moduleConfig;
-
+            private Channel<string>? _ttsQueue;
+            private Task? _ttsProcessingTask;
             public VoiceSession(VoiceClient voiceClient, Guild guild, TextChannel channel, VoiceModuleConfig ignoreConfig)
             {
                 VoiceClient = voiceClient;
@@ -214,34 +220,58 @@ namespace TranscriberBot.Commands.SlashCommands
                 _moduleConfig = ignoreConfig;
             }
 
-            public void EnableTts(GatewayClient client, TextChannel channel)
+            public async Task EnableTtsAsync(GatewayClient client, TextChannel channel)
             {
                 if (TtsEnabled) return;
                 TtsEnabled = true;
+
+                _ttsQueue = System.Threading.Channels.Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
+                _ttsProcessingTask = Task.Run(ProcessTtsQueueAsync);
+
                 _ttsHandler = async msg =>
                 {
-                    if (msg.Author.IsBot || msg.Channel.Id != channel.Id || _moduleConfig.TtsIgnore.Contains(msg.Author.Id)) return;
-                    await _ttsSem.WaitAsync();
-                    try
-                    {
-                        var text = msg.GetAsync().Result.Content;
-                        if (!string.IsNullOrWhiteSpace(text))
-                            await StreamWithGoogleTtsAsync(text);
-                    }
-                    finally { _ttsSem.Release(); }
+                    if (msg.Author.IsBot || msg.Channel.Id != channel.Id || _moduleConfig.TtsIgnore.Contains(msg.Author.Id))
+                        return;
+                    var text = msg.GetAsync().Result.Content;
+                    if (string.IsNullOrWhiteSpace(text)) return;
+                    await _ttsQueue!.Writer.WriteAsync(text);
                 };
                 client.MessageCreate += _ttsHandler;
-                VoiceClient.EnterSpeakingStateAsync(SpeakingFlags.Microphone);
+
+                await VoiceClient.EnterSpeakingStateAsync(SpeakingFlags.Microphone);
             }
 
-            public void DisableTts(GatewayClient client)
+            public async Task DisableTtsAsync(GatewayClient client)
             {
                 if (!TtsEnabled) return;
                 if (_ttsHandler != null)
                     client.MessageCreate -= _ttsHandler;
+
+                _ttsQueue?.Writer.Complete();
+                if (_ttsProcessingTask != null)
+                    await _ttsProcessingTask;
+
                 TtsEnabled = false;
             }
-
+            private async Task ProcessTtsQueueAsync()
+            {
+                await foreach (var text in _ttsQueue!.Reader.ReadAllAsync())
+                {
+                    await _ttsSem.WaitAsync();
+                    try
+                    {
+                        await StreamWithGoogleTtsAsync(text);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"TTS error: {ex}");
+                    }
+                    finally
+                    {
+                        _ttsSem.Release();
+                    }
+                }
+            }
             public void EnableTranscription()
             {
                 if (TranscriptionEnabled) return;
@@ -319,6 +349,8 @@ namespace TranscriberBot.Commands.SlashCommands
                     await opus.WriteAsync(buffer, 0, read);
                 await opus.FlushAsync();
             }
+
+
             public void Dispose()
             {
                 foreach (var ms in _buffers.Values) ms.Dispose();
