@@ -16,6 +16,8 @@
     <PackageReference Include="NetCord.Services" Version="1.0.0-alpha.359" />
     <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />
     <PackageReference Include="Opus" Version="1.0.0" />
+    <PackageReference Include="Whisper.net" Version="1.8.1" />
+    <PackageReference Include="Whisper.net.Runtime" Version="1.8.1" />
   </ItemGroup>
 
 </Project>

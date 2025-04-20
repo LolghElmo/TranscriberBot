@@ -11,6 +11,8 @@ using NetCord.Rest;
 using TranscriberBot.Data.Models;
 using TranscriberBot.Data.Handler;
 using System.Threading.Channels;
+using Whisper.net.Ggml;
+using Whisper.net;
 
 namespace TranscriberBot.Commands.SlashCommands
 {
@@ -24,13 +26,14 @@ namespace TranscriberBot.Commands.SlashCommands
         private static readonly TimeSpan SilenceThreshold = TimeSpan.FromMilliseconds(500);
         private static readonly HttpClient _http = new();
 
-
+        private static readonly string WhisperModelPath = "ggml-base.bin";
+        private static WhisperFactory? _whisperFactory;
+        private static readonly SemaphoreSlim _whisperFactoryLock = new(1, 1);
 
         private static void SaveIgnoreConfig()
         {
             JsonHandler.SaveJson(voiceModuleConfigPath, Bot.voiceModuleConfig);
         }
-
 
         [SubSlashCommand("join", "Join your current voice channel.")]
         public async Task JoinAsync()
@@ -54,7 +57,8 @@ namespace TranscriberBot.Commands.SlashCommands
                 new() { RedirectInputStreams = true }
             );
             await voiceClient.StartAsync();
-            var session = new VoiceSession(voiceClient, guild, (TextChannel)Context.Channel, Bot.voiceModuleConfig);
+            var whisperFactory = await GetWhisperFactoryAsync();
+            var session = new VoiceSession(voiceClient, guild, (TextChannel)Context.Channel, Bot.voiceModuleConfig, whisperFactory);
             _voiceSessions[guild.Id] = session;
         }
 
@@ -68,13 +72,13 @@ namespace TranscriberBot.Commands.SlashCommands
                 return;
             }
             session.DisableTranscription();
+            session.DisableWhisperTranscription();
             await session.DisableTtsAsync(Context.Client);
             await session.VoiceClient.CloseAsync();
             await Context.Client.UpdateVoiceStateAsync(new VoiceStateProperties(guildId, null));
             session.Dispose();
             await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Left the voice channel and disabled all features."));
         }
-
 
         [SubSlashCommand("enable_tts", "Enable TTS in the current session.")]
         public async Task EnableTtsAsync()
@@ -94,8 +98,6 @@ namespace TranscriberBot.Commands.SlashCommands
             await Context.Interaction.SendResponseAsync(InteractionCallback.Message("TTS enabled."));
         }
 
-
-
         [SubSlashCommand("disable_tts", "Disable TTS in the current session.")]
         public async Task DisableTtsAsync()
         {
@@ -109,7 +111,7 @@ namespace TranscriberBot.Commands.SlashCommands
             await Context.Interaction.SendResponseAsync(InteractionCallback.Message("TTS disabled."));
         }
 
-        [SubSlashCommand("enable_transcripts", "Enable live transcription in the current session.")]
+        [SubSlashCommand("enable_transcripts", "Enable live transcription in the current session (AssemblyAI).")]
         public async Task EnableTranscriptsAsync()
         {
             var guildId = Context.Guild!.Id;
@@ -124,10 +126,10 @@ namespace TranscriberBot.Commands.SlashCommands
                 return;
             }
             session.EnableTranscription();
-            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Transcription enabled."));
+            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Transcription enabled (AssemblyAI)."));
         }
 
-        [SubSlashCommand("disable_transcripts", "Disable live transcription in the current session.")]
+        [SubSlashCommand("disable_transcripts", "Disable live transcription in the current session (AssemblyAI).")]
         public async Task DisableTranscriptsAsync()
         {
             var guildId = Context.Guild!.Id;
@@ -137,7 +139,7 @@ namespace TranscriberBot.Commands.SlashCommands
                 return;
             }
             session.DisableTranscription();
-            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Transcription disabled."));
+            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Transcription disabled (AssemblyAI)."));
         }
 
         [SubSlashCommand("tts_ignore", "Ignore yourself from TTS.")]
@@ -194,6 +196,61 @@ namespace TranscriberBot.Commands.SlashCommands
             await Context.Interaction.SendResponseAsync(InteractionCallback.Message("You will now be processed for transcription."));
         }
 
+        [SubSlashCommand("trantest_enable", "Enable Whisper.net transcription in the current session.")]
+        public async Task TrantestEnableAsync()
+        {
+            var guildId = Context.Guild!.Id;
+            if (!_voiceSessions.TryGetValue(guildId, out var session))
+            {
+                await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Bot is not in a voice channel. Use /voice join first."));
+                return;
+            }
+            if (session.WhisperTranscriptionEnabled)
+            {
+                await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Whisper.net transcription already enabled."));
+                return;
+            }
+            session.EnableWhisperTranscription();
+            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Whisper.net transcription enabled."));
+        }
+
+        [SubSlashCommand("trantest_disable", "Disable Whisper.net transcription in the current session.")]
+        public async Task TrantestDisableAsync()
+        {
+            var guildId = Context.Guild!.Id;
+            if (!_voiceSessions.TryGetValue(guildId, out var session) || !session.WhisperTranscriptionEnabled)
+            {
+                await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Whisper.net transcription not enabled."));
+                return;
+            }
+            session.DisableWhisperTranscription();
+            await Context.Interaction.SendResponseAsync(InteractionCallback.Message("Whisper.net transcription disabled."));
+        }
+
+        private static async Task<WhisperFactory> GetWhisperFactoryAsync()
+        {
+            if (_whisperFactory != null)
+                return _whisperFactory;
+            await _whisperFactoryLock.WaitAsync();
+            try
+            {
+                if (_whisperFactory != null)
+                    return _whisperFactory;
+                if (!File.Exists(WhisperModelPath))
+                {
+                    using var modelStream = await WhisperGgmlDownloader.Default.GetGgmlModelAsync(GgmlType.Base);
+                    using var fileWriter = File.OpenWrite(WhisperModelPath);
+                    await modelStream.CopyToAsync(fileWriter);
+                }
+                _whisperFactory = WhisperFactory.FromPath(WhisperModelPath);
+                return _whisperFactory;
+            }
+            finally
+            {
+                _whisperFactoryLock.Release();
+            }
+        }
+
         private class VoiceSession : IDisposable
         {
             public VoiceClient VoiceClient { get; }
@@ -201,58 +258,61 @@ namespace TranscriberBot.Commands.SlashCommands
             public TextChannel TextChannel { get; }
             public bool TtsEnabled { get; private set; }
             public bool TranscriptionEnabled { get; private set; }
+            public bool WhisperTranscriptionEnabled { get; private set; }
             private Func<Message, ValueTask>? _ttsHandler;
             private Func<VoiceReceiveEventArgs, ValueTask>? _transcriptionHandler;
+            private Func<VoiceReceiveEventArgs, ValueTask>? _whisperTranscriptionHandler;
             private readonly SemaphoreSlim _ttsSem = new(MaxConcurrentTts);
             internal readonly SemaphoreSlim _transcriptionSem = new(MaxConcurrentTranscriptions);
+            internal readonly SemaphoreSlim _whisperTranscribeSem = new(MaxConcurrentTranscriptions);
             private readonly ConcurrentDictionary<ulong, MemoryStream> _buffers = new();
+            private readonly ConcurrentDictionary<ulong, MemoryStream> _whisperBuffers = new();
             private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _silenceCts = new();
+            private readonly ConcurrentDictionary<ulong, CancellationTokenSource> _whisperSilenceCts = new();
             private OpusDecoder? _decoder;
+            private OpusDecoder? _whisperDecoder;
             internal WaveFormat? _waveFormat;
+            internal WaveFormat? _whisperWaveFormat;
             private readonly VoiceModuleConfig _moduleConfig;
             private Channel<string>? _ttsQueue;
             private Task? _ttsProcessingTask;
-            public VoiceSession(VoiceClient voiceClient, Guild guild, TextChannel channel, VoiceModuleConfig ignoreConfig)
+            private readonly WhisperFactory _whisperFactory;
+
+            public VoiceSession(VoiceClient voiceClient, Guild guild, TextChannel channel, VoiceModuleConfig ignoreConfig, WhisperFactory whisperFactory)
             {
                 VoiceClient = voiceClient;
                 Guild = guild;
                 TextChannel = channel;
                 _moduleConfig = ignoreConfig;
+                _whisperFactory = whisperFactory;
             }
 
             public async Task EnableTtsAsync(GatewayClient client, TextChannel channel)
             {
                 if (TtsEnabled) return;
                 TtsEnabled = true;
-
                 _ttsQueue = System.Threading.Channels.Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = false });
                 _ttsProcessingTask = Task.Run(ProcessTtsQueueAsync);
-
                 _ttsHandler = async msg =>
                 {
-                    if (msg.Author.IsBot || msg.Channel.Id != channel.Id || _moduleConfig.TtsIgnore.Contains(msg.Author.Id))
-                        return;
+                    if (msg.Author.IsBot || msg.Channel.Id != channel.Id || _moduleConfig.TtsIgnore.Contains(msg.Author.Id)) return;
                     var text = msg.GetAsync().Result.Content;
                     if (string.IsNullOrWhiteSpace(text)) return;
                     await _ttsQueue!.Writer.WriteAsync(text);
                 };
                 client.MessageCreate += _ttsHandler;
-
                 await VoiceClient.EnterSpeakingStateAsync(SpeakingFlags.Microphone);
             }
 
             public async Task DisableTtsAsync(GatewayClient client)
             {
                 if (!TtsEnabled) return;
-                if (_ttsHandler != null)
-                    client.MessageCreate -= _ttsHandler;
-
+                if (_ttsHandler != null) client.MessageCreate -= _ttsHandler;
                 _ttsQueue?.Writer.Complete();
-                if (_ttsProcessingTask != null)
-                    await _ttsProcessingTask;
-
+                if (_ttsProcessingTask != null) await _ttsProcessingTask;
                 TtsEnabled = false;
             }
+
             private async Task ProcessTtsQueueAsync()
             {
                 await foreach (var text in _ttsQueue!.Reader.ReadAllAsync())
@@ -272,6 +332,28 @@ namespace TranscriberBot.Commands.SlashCommands
                     }
                 }
             }
+
+            public async Task StreamWithGoogleTtsAsync(string text)
+            {
+                var url = $"https://translate.google.com/translate_tts?tl=en&client=tw-ob&q={Uri.EscapeDataString(text)}";
+                using var resp = await _http.GetAsync(url);
+                resp.EnsureSuccessStatusCode();
+                using var ms = new MemoryStream();
+                await resp.Content.CopyToAsync(ms);
+                ms.Position = 0;
+                using var mp3 = new Mp3FileReader(ms);
+                var resampled = new MediaFoundationResampler(mp3, new WaveFormat(48000, 16, 2)) { ResamplerQuality = 60 };
+                using var pcmStream = resampled;
+                using var opus = new OpusEncodeStream(
+                    VoiceClient.CreateOutputStream(normalizeSpeed: true),
+                    PcmFormat.Short, VoiceChannels.Stereo, OpusApplication.Audio);
+                var buffer = new byte[pcmStream.WaveFormat.AverageBytesPerSecond];
+                int read;
+                while ((read = pcmStream.Read(buffer, 0, buffer.Length)) > 0)
+                    await opus.WriteAsync(buffer, 0, read);
+                await opus.FlushAsync();
+            }
+
             public void EnableTranscription()
             {
                 if (TranscriptionEnabled) return;
@@ -281,8 +363,7 @@ namespace TranscriberBot.Commands.SlashCommands
                 _transcriptionHandler = args =>
                 {
                     var uid = args.UserId;
-                    if (_moduleConfig.TranscriberIgnore.Contains(uid))
-                        return ValueTask.CompletedTask;
+                    if (_moduleConfig.TranscriberIgnore.Contains(uid)) return ValueTask.CompletedTask;
                     var buffer = GetBuffer(uid);
                     var pcm = new byte[Opus.SamplesPerChannel * _waveFormat.Channels * sizeof(short)];
                     _decoder.Decode(args.Frame.Span, pcm);
@@ -296,8 +377,7 @@ namespace TranscriberBot.Commands.SlashCommands
             public void DisableTranscription()
             {
                 if (!TranscriptionEnabled) return;
-                if (_transcriptionHandler != null)
-                    VoiceClient.VoiceReceive -= _transcriptionHandler;
+                if (_transcriptionHandler != null) VoiceClient.VoiceReceive -= _transcriptionHandler;
                 TranscriptionEnabled = false;
             }
 
@@ -312,7 +392,8 @@ namespace TranscriberBot.Commands.SlashCommands
             {
                 if (_silenceCts.TryGetValue(userId, out var existing))
                 {
-                    existing.Cancel(); existing.Dispose();
+                    existing.Cancel();
+                    existing.Dispose();
                 }
                 var cts = new CancellationTokenSource();
                 _silenceCts[userId] = cts;
@@ -327,68 +408,158 @@ namespace TranscriberBot.Commands.SlashCommands
                     catch (OperationCanceledException) { }
                 });
             }
-            public async Task StreamWithGoogleTtsAsync(string text)
+
+            private static async Task ProcessChunkAsync(ulong userId, Guild guild, VoiceSession session, MemoryStream ms)
             {
-                var url = $"https://translate.google.com/translate_tts?tl=en&client=tw-ob&q={Uri.EscapeDataString(text)}";
-                using var resp = await _http.GetAsync(url);
-                resp.EnsureSuccessStatusCode();
-                using var ms = new MemoryStream();
-                await resp.Content.CopyToAsync(ms);
-                ms.Position = 0;
-                using var mp3 = new Mp3FileReader(ms);
-                var resampled = new MediaFoundationResampler(mp3, new WaveFormat(48000, 16, 2)) { ResamplerQuality = 60 };
-                using var pcmStream = resampled;
-                using var opus = new OpusEncodeStream(
-                    VoiceClient.CreateOutputStream(normalizeSpeed: true),
-                    PcmFormat.Short,
-                    VoiceChannels.Stereo,
-                    OpusApplication.Audio);
-                var buffer = new byte[pcmStream.WaveFormat.AverageBytesPerSecond];
-                int read;
-                while ((read = pcmStream.Read(buffer, 0, buffer.Length)) > 0)
-                    await opus.WriteAsync(buffer, 0, read);
-                await opus.FlushAsync();
+                await session._transcriptionSem.WaitAsync();
+                try
+                {
+                    var file = Path.Combine(Path.GetTempPath(), $"transcript_{userId}_{Guid.NewGuid()}.wav");
+                    using (var writer = new WaveFileWriter(file, session._waveFormat))
+                        writer.Write(ms.ToArray(), 0, (int)ms.Length);
+                    var client = new AssemblyAIClient(Bot.botConfig?.AssemblyAIToken ?? "no api key");
+                    var transcript = await client.Transcripts.TranscribeAsync(
+                        new FileInfo(file),
+                        new TranscriptOptionalParams { SpeakerLabels = false }
+                    );
+                    transcript.EnsureStatusCompleted();
+                    if (!string.IsNullOrWhiteSpace(transcript.Text))
+                    {
+                        var user = await guild.GetUserAsync(userId);
+                        await session.TextChannel.SendMessageAsync($"**{user.Username}:** {transcript.Text}");
+                    }
+                    File.Delete(file);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Error transcribing {userId}: {ex}");
+                }
+                finally
+                {
+                    session._transcriptionSem.Release();
+                }
             }
 
+            public void EnableWhisperTranscription()
+            {
+                if (WhisperTranscriptionEnabled) return;
+                WhisperTranscriptionEnabled = true;
+                _whisperDecoder = new OpusDecoder(VoiceChannels.Stereo);
+                _whisperWaveFormat = new WaveFormat(48000, 16, 2);
+                _whisperTranscriptionHandler = args =>
+                {
+                    var userId = args.UserId;
+                    var buf = _whisperBuffers.GetOrAdd(userId, _ => new MemoryStream());
+                    var pcm = new byte[Opus.SamplesPerChannel * _whisperWaveFormat.Channels * sizeof(short)];
+                    _whisperDecoder.Decode(args.Frame.Span, pcm);
+                    buf.Write(pcm, 0, pcm.Length);
+                    StartWhisperSilenceTimer(userId);
+                    return ValueTask.CompletedTask;
+                };
+                VoiceClient.VoiceReceive += _whisperTranscriptionHandler;
+            }
+
+            public void DisableWhisperTranscription()
+            {
+                if (!WhisperTranscriptionEnabled) return;
+                if (_whisperTranscriptionHandler != null) VoiceClient.VoiceReceive -= _whisperTranscriptionHandler;
+                WhisperTranscriptionEnabled = false;
+            }
+
+            private void StartWhisperSilenceTimer(ulong userId)
+            {
+                if (_whisperSilenceCts.TryGetValue(userId, out var old))
+                {
+                    old.Cancel();
+                    old.Dispose();
+                }
+                var cts = new CancellationTokenSource();
+                _whisperSilenceCts[userId] = cts;
+                _ = Task.Run(async () =>
+                {
+                    try
+                    {
+                        await Task.Delay(SilenceThreshold, cts.Token);
+                        var ms = ResetWhisperBuffer(userId);
+                        await ProcessWhisperChunkAsync(userId, ms);
+                    }
+                    catch (OperationCanceledException) { }
+                });
+            }
+
+            private MemoryStream ResetWhisperBuffer(ulong uid)
+            {
+                var old = _whisperBuffers[uid];
+                _whisperBuffers[uid] = new MemoryStream();
+                return old;
+            }
+
+            private async Task ProcessWhisperChunkAsync(ulong userId, MemoryStream ms)
+            {
+                await _whisperTranscribeSem.WaitAsync();
+                try
+                {
+                    var tempFile = Path.Combine(Path.GetTempPath(), $"whisper_{userId}_{Guid.NewGuid()}_48k.wav");
+                    using (var writer = new WaveFileWriter(tempFile, _whisperWaveFormat!))
+                        writer.Write(ms.ToArray(), 0, (int)ms.Length);
+                    var targetFormat = new WaveFormat(16000, 16, 1);
+                    var resampledFile = Path.Combine(Path.GetTempPath(), $"whisper_{userId}_{Guid.NewGuid()}_16k.wav");
+                    using (var sourceStream = new AudioFileReader(tempFile))
+                    using (var resampler = new MediaFoundationResampler(sourceStream, targetFormat) { ResamplerQuality = 60 })
+                    using (var outWriter = new WaveFileWriter(resampledFile, resampler.WaveFormat))
+                    {
+                        byte[] buffer = new byte[resampler.WaveFormat.AverageBytesPerSecond];
+                        int read;
+                        while ((read = resampler.Read(buffer, 0, buffer.Length)) > 0)
+                            outWriter.Write(buffer, 0, read);
+                    }
+                    File.Delete(tempFile);
+                    var segments = new List<string>();
+                    using var audioStream = File.OpenRead(resampledFile);
+                    var processor = _whisperFactory
+                        .CreateBuilder()
+                        .WithGreedySamplingStrategy()
+                        .ParentBuilder
+                        .WithLanguage("english")
+                        .Build();
+                    await foreach (var result in processor.ProcessAsync(audioStream))
+                        segments.Add(result.Text);
+                    var transcript = string.Join(" ", segments);
+                    if (!string.IsNullOrWhiteSpace(transcript))
+                    {
+                        var user = await Guild.GetUserAsync(userId);
+                        await TextChannel.SendMessageAsync($"**{user.Username}:** {transcript} \n -# This is still being tested.");
+                    }
+                    File.Delete(resampledFile);
+                }
+                catch (Exception ex)
+                {
+                    Debug.WriteLine($"Whisper.net error: {ex}");
+                }
+                finally
+                {
+                    _whisperTranscribeSem.Release();
+                }
+            }
 
             public void Dispose()
             {
                 foreach (var ms in _buffers.Values) ms.Dispose();
-                foreach (var kvp in _silenceCts.Values) { kvp.Cancel(); kvp.Dispose(); }
+                foreach (var ms in _whisperBuffers.Values) ms.Dispose();
+                foreach (var kvp in _silenceCts.Values)
+                {
+                    kvp.Cancel();
+                    kvp.Dispose();
+                }
+                foreach (var kvp in _whisperSilenceCts.Values)
+                {
+                    kvp.Cancel();
+                    kvp.Dispose();
+                }
                 _ttsSem.Dispose();
                 _transcriptionSem.Dispose();
+                _whisperTranscribeSem.Dispose();
                 VoiceClient.Dispose();
-            }
-        }
-
-        private static async Task ProcessChunkAsync(ulong userId, Guild guild, VoiceSession session, MemoryStream ms)
-        {
-            await session._transcriptionSem.WaitAsync();
-            try
-            {
-                var file = Path.Combine(Path.GetTempPath(), $"transcript_{userId}_{Guid.NewGuid()}.wav");
-                using (var writer = new WaveFileWriter(file, session._waveFormat))
-                    writer.Write(ms.ToArray(), 0, (int)ms.Length);
-                var client = new AssemblyAIClient(Bot.botConfig?.AssemblyAIToken ?? "no api key");
-                var transcript = await client.Transcripts.TranscribeAsync(
-                    new FileInfo(file),
-                    new TranscriptOptionalParams { SpeakerLabels = false }
-                );
-                transcript.EnsureStatusCompleted();
-                if (!string.IsNullOrWhiteSpace(transcript.Text))
-                {
-                    var user = await guild.GetUserAsync(userId);
-                    await session.TextChannel.SendMessageAsync($"**{user.Username}:** {transcript.Text}");
-                }
-                File.Delete(file);
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error transcribing {userId}: {ex}");
-            }
-            finally
-            {
-                session._transcriptionSem.Release();
             }
         }
     }
